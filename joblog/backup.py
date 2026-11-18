@@ -34,6 +34,19 @@ Verified restore to an independent target
     aside first and restored on failure, so a corrupt backup or a restore error
     leaves the existing target byte-identical.  The source database is never
     opened for writing during restore and remains writable throughout.
+
+Recovery of accidentally deleted rows
+    A published backup can be used to put a job's rows back into the source
+    database after an operator deleted them.  The backup is re-verified first,
+    then one ``BEGIN IMMEDIATE`` transaction inspects every backup row id: rows
+    already present with identical ``(job_id, message, created_at)`` are
+    skipped, missing rows are re-inserted with their original ``id`` and
+    ``created_at``, and any id holding different content aborts the whole
+    transaction before anything is written.  Because appends also serialise on
+    SQLite's write lock, a recovery is atomic with respect to appends: either
+    all missing rows appear or none do, a concurrent append can never be
+    overwritten, and retrying an interrupted or already-applied recovery
+    inserts nothing new.
 """
 
 from __future__ import annotations
@@ -78,6 +91,22 @@ class RestoreError(BackupError):
 
 class TargetExistsError(RestoreError):
     pass
+
+
+class RecoveryError(BackupError):
+    """Base class for failures while copying deleted rows into the source."""
+
+
+class RecoveryJobNotFound(RecoveryError):
+    """The backup contains no rows for the requested job id."""
+
+
+class RecoveryConflict(RecoveryError):
+    """The source already holds different content at a backup row's id."""
+
+    def __init__(self, message: str, *, conflicting_ids: list[int] | None = None):
+        self.conflicting_ids = list(conflicting_ids or [])
+        super().__init__(message)
 
 
 def utc_now() -> str:
@@ -192,6 +221,19 @@ class RestoreResult:
     backup_id: str
     target_path: str
     verified_files: list[str]
+    row_count: int
+    max_id: int | None
+
+
+@dataclass
+class RecoveryResult:
+    backup_id: str
+    job_id: str
+    backup_row_count: int
+    inserted_count: int
+    skipped_count: int
+    inserted_min_id: int | None
+    inserted_max_id: int | None
     row_count: int
     max_id: int | None
 
@@ -543,6 +585,106 @@ class BackupManager:
         """Return the database path of a verified, published backup."""
         self._verified_ready_row(backup_id)
         return self._backup_dir(backup_id) / DB_NAME
+
+    # -------------------------------------------------------------- recovering
+    def recover_job(
+        self,
+        backup_id: str,
+        job_id: str,
+        *,
+        after_validate: Callable[[], None] | None = None,
+    ) -> RecoveryResult:
+        """Copy a job's rows from a published backup back into the source.
+
+        The backup is fully verified before the source is opened for writing.
+        Validation and insertion then run in one ``BEGIN IMMEDIATE``
+        transaction, which serialises against appends and makes the operation
+        atomic: a conflict rejects the entire recovery, a failure rolls back
+        everything, and re-running it skips rows that are already identical.
+
+        ``after_validate`` is an internal test hook invoked with the write lock
+        held and before any insert; it has no effect on the result.
+        """
+        if not isinstance(job_id, str) or not job_id:
+            raise RecoveryError("job_id must be a non-empty string")
+
+        # Manifest, SHA-256 and SQLite integrity are checked before any write.
+        self._verified_ready_row(backup_id)
+        backup_db = self._backup_dir(backup_id) / DB_NAME
+        uri = f"file:{backup_db.as_posix()}?mode=ro&immutable=1"
+        try:
+            with closing(sqlite3.connect(uri, uri=True, timeout=10)) as conn:
+                conn.row_factory = sqlite3.Row
+                backup_rows = conn.execute(
+                    "SELECT id, job_id, message, created_at FROM job_logs"
+                    " WHERE job_id = ? ORDER BY id",
+                    (job_id,),
+                ).fetchall()
+        except sqlite3.DatabaseError as exc:
+            raise RecoveryError(f"backup database unreadable: {exc}") from exc
+
+        if not backup_rows:
+            raise RecoveryJobNotFound(
+                f"backup {backup_id!r} contains no rows for job {job_id!r}"
+            )
+
+        inserted_ids: list[int] = []
+        skipped = 0
+        with self.database.writer() as conn:
+            # Validate every id against the source while holding the write lock,
+            # so no append can interleave between this check and the inserts.
+            conflicts: list[int] = []
+            missing: list[sqlite3.Row] = []
+            for row in backup_rows:
+                existing = conn.execute(
+                    "SELECT job_id, message, created_at FROM job_logs WHERE id = ?",
+                    (row["id"],),
+                ).fetchone()
+                if existing is None:
+                    missing.append(row)
+                elif (
+                    existing["job_id"],
+                    existing["message"],
+                    existing["created_at"],
+                ) == (row["job_id"], row["message"], row["created_at"]):
+                    skipped += 1
+                else:
+                    conflicts.append(int(row["id"]))
+            if conflicts:
+                preview = ", ".join(str(i) for i in conflicts[:10])
+                more = "" if len(conflicts) <= 10 else f" (+{len(conflicts) - 10} more)"
+                raise RecoveryConflict(
+                    "source rows with the same id hold different content;"
+                    f" nothing recovered (conflicting ids: {preview}{more})",
+                    conflicting_ids=conflicts,
+                )
+
+            if after_validate is not None:
+                after_validate()
+
+            for row in missing:
+                conn.execute(
+                    "INSERT INTO job_logs (id, job_id, message, created_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (row["id"], row["job_id"], row["message"], row["created_at"]),
+                )
+                inserted_ids.append(int(row["id"]))
+
+            count, max_id = conn.execute(
+                "SELECT COUNT(*), MAX(id) FROM job_logs"
+            ).fetchone()
+
+        return RecoveryResult(
+            backup_id=backup_id,
+            job_id=job_id,
+            backup_row_count=len(backup_rows),
+            inserted_count=len(inserted_ids),
+            skipped_count=skipped,
+            inserted_min_id=min(inserted_ids) if inserted_ids else None,
+            inserted_max_id=max(inserted_ids) if inserted_ids else None,
+            row_count=int(count),
+            max_id=max_id,
+        )
 
     # -------------------------------------------------------------- restoring
     def restore(

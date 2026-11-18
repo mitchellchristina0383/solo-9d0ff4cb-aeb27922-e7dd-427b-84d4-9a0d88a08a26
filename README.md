@@ -35,6 +35,7 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 | `GET`  | `/backups/{id}/verify` | Re-check manifest, SHA-256 and SQLite integrity |
 | `GET`  | `/backups/{id}/download` | Download the verified `.db` file |
 | `POST` | `/backups/{id}/restore` | Restore into an independent target (`target_name`, `overwrite`) |
+| `POST` | `/backups/{id}/recover` | Copy a deleted job's rows from the backup back into the source (`job_id`) |
 | `GET`  | `/restores/{target_name}/logs` | Read logs from a restored target (read-only) |
 | `GET`  | `/health` | Liveness/readiness |
 
@@ -48,6 +49,28 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
 5. `POST /backups/{id}/restore` with `{"target_name": "incident-2026.db"}`.
 6. `GET /restores/incident-2026.db/logs` — shows the logs committed before the
    backup and none appended afterwards.
+
+### Recovering deleted rows into the source
+
+`POST /backups/{id}/recover` with `{"job_id": "..."}` copies that job's rows
+from a published backup back into the live source database, keeping their
+original `id` and `created_at`:
+
+1. The backup is fully re-verified (manifest hash, database hash,
+   `integrity_check`) before the source is opened for writing.
+2. In one `BEGIN IMMEDIATE` transaction every backup row of the job is compared
+   by id with the source:
+   * id missing → re-inserted with the original `id` and `created_at`;
+   * id present with identical `(job_id, message, created_at)` → skipped;
+   * id present with different content → the whole request is rejected with
+     `409` and nothing is written.
+3. The response reports `inserted_count`, `skipped_count` and the resulting
+   source row count. Retrying the same request inserts nothing.
+
+Rows appended after the backup and all other jobs are untouched. Recovered rows
+are ordinary source rows, so `GET /logs` pages them by their original id and any
+later `POST /backups` includes them; already-published backups and their
+independent restores are unaffected.
 
 ## Guarantees and how they are achieved
 
@@ -81,6 +104,14 @@ JOBLOG_DATA_DIR=./data uvicorn joblog.main:app --port 8000
   `/data/restores`; later appends to the source and later writes to the target
   are isolated from each other.  The restore endpoint never opens the source
   for writing.
+* **Atomic, idempotent row recovery.**  Validating every backup row against the
+  source and re-inserting the missing ones happen inside a single
+  `BEGIN IMMEDIATE` transaction, the same lock appends take.  A concurrent
+  append therefore either finishes before the validation (and its id is seen)
+  or waits until the recovery commits (and gets a new id via `AUTOINCREMENT`),
+  never a recovered id.  A conflict or any error rolls the whole transaction
+  back, so the source is never left partially recovered, and re-running the
+  request skips rows that are already identical.
 
 ## Tests
 
@@ -92,7 +123,10 @@ python -m pytest
 The suite covers concurrent appends during a backup, frozen-snapshot
 behaviour, immutable published backups, independent restore, corrupt-backup
 restore with the target preserved, interrupted backups after restart,
-`ready`-row demotion, backup failure, restart persistence and `/docs`.
+`ready`-row demotion, backup failure, restart persistence, `/docs`, and row
+recovery (restored ids/timestamps, post-backup rows and other jobs untouched,
+idempotent retry, conflict rejection with nothing written, rollback on a
+mid-recovery fault, and appends interleaved with a recovery).
 
 ## Notes / limits
 

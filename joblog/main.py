@@ -17,6 +17,9 @@ from .backup import (
     BackupManager,
     BackupNotFound,
     BackupVerificationError,
+    RecoveryConflict,
+    RecoveryError,
+    RecoveryJobNotFound,
     RestoreError,
     TargetExistsError,
 )
@@ -88,6 +91,26 @@ class RestoreResultView(BaseModel):
     max_id: int | None
 
 
+class RecoverRequest(BaseModel):
+    job_id: str = Field(
+        min_length=1,
+        max_length=200,
+        description="Job whose rows are copied back from the backup.",
+    )
+
+
+class RecoverResultView(BaseModel):
+    backup_id: str
+    job_id: str
+    backup_row_count: int
+    inserted_count: int
+    skipped_count: int
+    inserted_min_id: int | None
+    inserted_max_id: int | None
+    row_count: int
+    max_id: int | None
+
+
 class RestoredLogView(BaseModel):
     target_name: str
     items: list[LogEntry]
@@ -142,9 +165,10 @@ def create_app(
 
     app = FastAPI(
         title="Job Log Service",
-        version="1.0.0",
+        version="1.1.0",
         description=(
-            "Append-only job logs with consistent, immutable backups and verified restore.\n\n"
+            "Append-only job logs with consistent, immutable backups, verified restore, "
+            "and verified recovery of accidentally deleted rows.\n\n"
             "Backups are published only after the snapshot and its SHA-256 manifest have "
             "been verified. Restores target an independent database file and leave the "
             "source database writable."
@@ -324,6 +348,66 @@ def create_app(
             backup_id=result.backup_id,
             target_path=result.target_path,
             verified_files=result.verified_files,
+            row_count=result.row_count,
+            max_id=result.max_id,
+        )
+
+    @app.post(
+        "/backups/{backup_id}/recover",
+        response_model=RecoverResultView,
+        tags=["recovery"],
+        summary="Copy a job's deleted rows from a backup back into the source",
+        description=(
+            "Re-verifies the published backup, then compares every row of the job "
+            "in the backup against the source by id. Rows already present with "
+            "identical content are skipped; missing rows are re-inserted with "
+            "their original id and created_at. If any id holds different content "
+            "the whole request is rejected with 409 and nothing is written. The "
+            "check and the inserts run in one BEGIN IMMEDIATE transaction, the "
+            "same write lock appends take: a recovery cannot interleave with an "
+            "append, a failure rolls back every insert so the source is "
+            "unchanged, and retrying inserts nothing new. Logs appended after the "
+            "backup and other jobs are untouched; later backups include the "
+            "recovered rows and already-published backups still restore."
+        ),
+    )
+    def recover_backup_job(
+        backup_id: str, request: RecoverRequest
+    ) -> RecoverResultView:
+        try:
+            result = manager.recover_job(backup_id, request.job_id)
+        except BackupNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RecoveryJobNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except RecoveryConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "message": str(exc),
+                    "conflicting_ids": exc.conflicting_ids,
+                    "source_unchanged": True,
+                },
+            ) from exc
+        except BackupVerificationError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail=f"backup verification failed, source unchanged: {exc}",
+            ) from exc
+        except (RecoveryError, sqlite3.Error, OSError) as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"recovery failed, source unchanged: {exc}",
+            ) from exc
+
+        return RecoverResultView(
+            backup_id=result.backup_id,
+            job_id=result.job_id,
+            backup_row_count=result.backup_row_count,
+            inserted_count=result.inserted_count,
+            skipped_count=result.skipped_count,
+            inserted_min_id=result.inserted_min_id,
+            inserted_max_id=result.inserted_max_id,
             row_count=result.row_count,
             max_id=result.max_id,
         )
